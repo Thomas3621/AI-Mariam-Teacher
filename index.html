@@ -270,9 +270,19 @@ let voices=[];
 function rv(){try{voices=speechSynthesis.getVoices()||[]}catch(e){voices=[]}}
 if(hasTTS){rv();try{speechSynthesis.addEventListener("voiceschanged",rv)}catch(e){}setTimeout(rv,800)}
 function voicesFor(code){const b=code.split("-")[0];return voices.filter(v=>(v.lang||"").toLowerCase().replace("_","-").startsWith(b))}
-function pickVoice(code){const list=voicesFor(code);
-  return list.find(v=>/female|woman|lekha|swara|kalpana|heera|sobhana|neerja|veena|meera/i.test(v.name))||list.find(v=>/IN/i.test(v.lang))||list[0]||null}
-let speakToken=0,keepAlive=null,curResolve=null;
+// Mariam is a woman: always prefer a woman's voice. Names come from iPhone/Mac, Windows/Edge, Chrome and Android voice lists.
+const FEMALE=/female|woman|veena|lekha|heera|kalpana|neerja|swara|sobhana|meera|samantha|karen|moira|tessa|fiona|victoria|allison|\bava\b|susan|zoe|nicky|kathy|serena|zira|hazel|catherine|aria|jenny|sonia|libby|natasha|isha|ananya|aditi|raveena|priya|google uk english female|google us english|google हिन्दी/i;
+const MALE=/\bmale\b|rishi|ravi|hemant|prabhat|madhur|midhun|daniel|\balex\b|fred|aaron|arthur|gordon|\btom\b|oliver|david|\bmark\b|george|james|\bguy\b|ryan|thomas|reed|rocko|grandpa|eddy|ralph|albert|bruce|junior|aarav|kunal/i;
+function voiceRank(v){return FEMALE.test(v.name)?0:MALE.test(v.name)?2:1}
+function pickVoice(code){
+  const lc=x=>(x.lang||"").toLowerCase().replace("_","-"),c=code.toLowerCase(),base=c.split("-")[0];
+  const best=list=>list.slice().sort((a,b)=>voiceRank(a)-voiceRank(b)||((b.localService?1:0)-(a.localService?1:0)))[0]||null;
+  let v=best(voices.filter(x=>lc(x)===c));
+  // a woman's voice from another region of the same language beats a man's voice from this region
+  if(!v||voiceRank(v)>0){const o=best(voices.filter(x=>lc(x).startsWith(base)));if(o&&(!v||voiceRank(o)<voiceRank(v)))v=o}
+  return v;
+}
+let speakToken=0,keepAlive=null,curResolve=null,uttKeep=[];
 function show(text,note){caption.textContent=text;if(note){const h=document.createElement("span");h.className="hint";h.textContent=note;caption.append(h)}}
 function readCaptions(parts,token,done,note){
   let i=0;const step=()=>{if(token!==speakToken)return;if(i>=parts.length){setMode("ready");done();return}
@@ -316,29 +326,38 @@ function speak(text,code){
     let voice=pickVoice(code),sayCode=code,spell=s=>s;
     if(!voice&&code==="ml-IN"){voice=pickVoice("en-IN")||pickVoice("en-US");sayCode=voice?voice.lang:"en-IN";spell=manglish}
     else if(!voice&&code==="hi-IN"&&voices.length){readCaptions(parts,token,resolve,"No Hindi voice on this device. Add it in your phone's speech settings.");return}
-    let started=false,finished=false;
+    let started=false,finished=false,retried=false,attempt=0;
     const NOSOUND=IOS?"No sound? Switch off silent mode and turn the volume up.":"";
     const go=()=>{
       if(token!==speakToken)return resolve();
+      const att=++attempt,useVoice=retried?null:voice;
+      // only a man's voice on this device: lift the pitch so she still sounds like a woman
+      const pitch=useVoice&&voiceRank(useVoice)===2?1.32:1.08;
       parts.forEach((p,i)=>{
-        const u=new SpeechSynthesisUtterance(spell(p));u.lang=sayCode;if(voice)u.voice=voice;u.rate=IOS?.92:.95;u.pitch=1.05;u.volume=1;
-        u.onstart=()=>{if(token!==speakToken)return;started=true;show(p);setMode("speak")};
+        const u=new SpeechSynthesisUtterance(spell(p));u.lang=useVoice?useVoice.lang:sayCode;u.rate=IOS?.92:.95;u.pitch=pitch;u.volume=1;
+        if(useVoice)u.voice=useVoice;
+        uttKeep.push(u);   // keep a reference so the browser doesn't drop the sentence before it is spoken
+        u.onstart=()=>{if(token!==speakToken||att!==attempt)return;started=true;show(p);setMode("speak")};
         u.onboundary=()=>{pulse=1};
-        if(i===parts.length-1)u.onend=()=>{if(token!==speakToken||finished)return;finished=true;clearInterval(keepAlive);
+        if(i===parts.length-1)u.onend=()=>{if(token!==speakToken||att!==attempt||finished)return;finished=true;clearInterval(keepAlive);
           if(!started){readCaptions(parts,token,resolve,NOSOUND);return}setMode("ready");resolve()};
-        u.onerror=e=>{if(token!==speakToken||finished||(e&&/interrupted|canceled/.test(e.error)))return;finished=true;clearInterval(keepAlive);readCaptions(parts.slice(i),token,resolve,NOSOUND)};
+        u.onerror=e=>{if(token!==speakToken||att!==attempt||finished||(e&&/interrupted|canceled/.test(e.error)))return;finished=true;clearInterval(keepAlive);readCaptions(parts.slice(i),token,resolve,NOSOUND)};
         speechSynthesis.speak(u);
       });
       clearInterval(keepAlive);
       if(!IOS)keepAlive=setInterval(()=>{try{if(speechSynthesis.speaking)speechSynthesis.resume()}catch(e){}},4000);
-      setTimeout(()=>{if(token!==speakToken||started||finished)return;
-        if(!speechSynthesis.speaking&&!speechSynthesis.pending){finished=true;readCaptions(parts,token,resolve,NOSOUND)}else{show(parts[0]);setMode("speak")}},3000);
+      setTimeout(()=>{if(token!==speakToken||att!==attempt||started||finished)return;
+        if(!speechSynthesis.speaking&&!speechSynthesis.pending){
+          // the chosen voice may not be downloaded on this phone: try once more with the phone's default voice
+          if(useVoice&&!retried){retried=true;try{speechSynthesis.cancel()}catch(e){}uttKeep=[];setTimeout(go,120);return}
+          finished=true;readCaptions(parts,token,resolve,NOSOUND)}
+        else{show(parts[0]);setMode("speak")}},2500);
     };
     // speak straight away (iPhones only allow speech that starts from a tap); wait a moment only after cancelling earlier speech
     if(busyBefore)setTimeout(go,120);else go();
   });
 }
-function stopVoice(){speakToken++;clearInterval(keepAlive);try{speechSynthesis.cancel()}catch(e){}if(mode==="speak")setMode("ready");const r=curResolve;curResolve=null;if(r)r()}
+function stopVoice(){speakToken++;uttKeep=[];clearInterval(keepAlive);try{speechSynthesis.cancel()}catch(e){}if(mode==="speak")setMode("ready");const r=curResolve;curResolve=null;if(r)r()}
 
 /* ---------- voice in: one microphone session for the whole talk ---------- */
 const SR=window.SpeechRecognition||window.webkitSpeechRecognition;
@@ -422,21 +441,33 @@ How you talk:
 const GREET="നമസ്കാരം കുട്ടീ! ഞാൻ മറിയം ടീച്ചർ. മലയാളത്തിലോ ഇംഗ്ലീഷിലോ ഹിന്ദിയിലോ എന്നോട് സംസാരിക്കാം. നിന്റെ പേരെന്താ?";
 
 const standalone=!(window.claude&&window.claude.use);
-const BUILT_IN_KEY="";   // a kiosk copy of this file can carry its key here
+const BUILT_IN_KEY="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";   // a kiosk copy of this file can carry its key here
 let memKey="";
-function getKey(){let k="";try{k=localStorage.getItem("mariam-key")||""}catch(e){}return k||memKey||BUILT_IN_KEY}
-function setKey(v){memKey=v||"";try{v?localStorage.setItem("mariam-key",v):localStorage.removeItem("mariam-key")}catch(e){}}
+function getKey(){let k="";try{k=localStorage.getItem("mariam-key")||""}catch(e){}return memKey||BUILT_IN_KEY||k}
+function setKey(v){memKey=v||"";try{localStorage.removeItem("mariam-auth")}catch(e){}if(typeof authWay!=="undefined")authWay="";try{v?localStorage.setItem("mariam-key",v):localStorage.removeItem("mariam-key")}catch(e){}}
+// Keys are sent the current way (Authorization: Bearer); older keys fall back to x-api-key. The way that works is remembered.
+let authWay="";try{authWay=localStorage.getItem("mariam-auth")||""}catch(e){}
+async function callApi(model,msgs,way){
+  const h={"content-type":"application/json","anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"};
+  if(way==="bearer")h["authorization"]="Bearer "+getKey();else h["x-api-key"]=getKey();
+  return fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:h,body:JSON.stringify({model,max_tokens:500,system:PERSONA,messages:msgs})});
+}
 async function askApi(){
   const msgs=[{role:"user",content:"(The student pressed Start talk.)"}];
   history.slice(-14).forEach(m=>{const last=msgs[msgs.length-1];if(last.role===m.role)last.content+="\n"+m.content;else msgs.push({role:m.role,content:m.content})});
+  const ways=authWay?[authWay,authWay==="bearer"?"xkey":"bearer"]:["bearer","xkey"];
   let lastErr=null;
   for(const model of ["claude-haiku-5-5","claude-sonnet-5-5"]){
-    let r;try{r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"content-type":"application/json","x-api-key":getKey(),
-      "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model,max_tokens:500,system:PERSONA,messages:msgs})})}catch(e){throw {code:"offline"}}
+    let r=null,authFail=null,netFail=false;
+    for(const way of ways){
+      try{r=await callApi(model,msgs,way)}catch(e){netFail=true;r=null;continue}
+      if(r.status===401||r.status===403){let why="";try{const j=await r.json();why=(j&&j.error&&j.error.message)||""}catch(e){}authFail={code:"bad_key",why};r=null;continue}
+      if(authWay!==way){authWay=way;try{localStorage.setItem("mariam-auth",way)}catch(e){}}
+      break;
+    }
+    if(!r){if(authFail)throw authFail;if(netFail)throw {code:"offline"};throw {code:"api"}}
     if(r.ok){const j=await r.json();return (j.content||[]).filter(c=>c.type==="text").map(c=>c.text).join(" ")}
     let why="";try{const j=await r.json();why=(j&&j.error&&j.error.message)||""}catch(e){}
-    if(r.status===401||r.status===403)throw {code:"bad_key",why};   // keep the saved key; just report it
     if(r.status===429)throw {code:"rate_limited",why};
     lastErr={code:"api",status:r.status,why};if(r.status!==404&&r.status!==400)break;
   }
