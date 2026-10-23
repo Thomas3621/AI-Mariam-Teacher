@@ -278,32 +278,64 @@ function readCaptions(parts,token,done,note){
   let i=0;const step=()=>{if(token!==speakToken)return;if(i>=parts.length){setMode("ready");done();return}
     show(parts[i],note);setMode("speak");const ms=Math.max(1600,parts[i].length*75);i++;setTimeout(step,ms)};step();
 }
+const IOS=/iP(hone|ad|od)/.test(navigator.userAgent)||(navigator.platform==="MacIntel"&&navigator.maxTouchPoints>1);
+// Phones without a Malayalam voice (every iPhone) read Malayalam aloud from a Latin-letter spelling with an Indian English voice.
+const ML_V={"അ":"a","ആ":"aa","ഇ":"i","ഈ":"ee","ഉ":"u","ഊ":"oo","ഋ":"ru","എ":"e","ഏ":"ay","ഐ":"ai","ഒ":"o","ഓ":"o","ഔ":"au"};
+const ML_S={"ാ":"aa","ി":"i","ീ":"ee","ു":"u","ൂ":"oo","ൃ":"ru","െ":"e","േ":"ay","ൈ":"ai","ൊ":"o","ോ":"o","ൌ":"au","ൗ":"au"};
+const ML_C={"ക":"k","ഖ":"kh","ഗ":"g","ഘ":"gh","ങ":"ng","ച":"ch","ഛ":"chh","ജ":"j","ഝ":"jh","ഞ":"nj","ട":"t","ഠ":"th","ഡ":"d","ഢ":"dh","ണ":"n",
+  "ത":"th","ഥ":"th","ദ":"d","ധ":"dh","ന":"n","പ":"p","ഫ":"f","ബ":"b","ഭ":"bh","മ":"m","യ":"y","ര":"r","ല":"l","വ":"v","ശ":"sh","ഷ":"sh",
+  "സ":"s","ഹ":"h","ള":"l","ഴ":"l","റ":"r","ഩ":"n","ഺ":"t"};
+const ML_X={"ൺ":"n","ൻ":"n","ർ":"r","ൽ":"l","ൾ":"l","ൿ":"k","ം":"m","ഃ":"h"};
+function manglish(txt){
+  txt=txt.replace(/[‌‍]/g,"").replace(/ന്റ/g,"").replace(/റ്റ/g,"");
+  let out="";const ch=[...txt];
+  for(let i=0;i<ch.length;i++){
+    const c=ch[i],n=ch[i+1];
+    if(c===""||c===""||ML_C[c]){
+      out+=c===""?"nt":c===""?"tt":ML_C[c];
+      if(n==="്"){i++;const nn=ch[i+1];if(!nn||!/[ഀ-ൿ]/.test(nn))out+="u"}   // word-final virama is a short "u"
+      else if(ML_S[n]){out+=ML_S[n];i++}
+      else out+="a";
+    }else if(ML_V[c])out+=ML_V[c];
+    else if(c==="ം"&&/[കഗങ]/.test(n||""))out+="n";
+    else if(ML_X[c])out+=ML_X[c];
+    else if(ML_S[c]||c==="്"){}
+    else out+=c;
+  }
+  return out.replace(/o\b/g,"oh").replace(/thth/g,"tth").replace(/chch/g,"cch").replace(/shsh/g,"ssh");
+}
 function speak(text,code){
   return new Promise(res=>{
+    const busyBefore=hasTTS&&(speechSynthesis.speaking||speechSynthesis.pending);
     stopVoice();
     const resolve=()=>{if(curResolve===resolve)curResolve=null;res()};curResolve=resolve;
     const parts=text.split(/(?<=[.!?।])\s+|\n+/).map(s=>s.trim()).filter(Boolean);
     if(!parts.length){resolve();return}
     const token=++speakToken;
-    const voice=hasTTS?pickVoice(code):null;
-    if(!hasTTS){readCaptions(parts,token,resolve,"Voice doesn't work in this app view. Open the link in Chrome or Safari to hear her.");return}
-    if(!voice&&voices.length&&code!=="en-IN"){readCaptions(parts,token,resolve,`No ${code==="ml-IN"?"Malayalam":"Hindi"} voice on this device. Add it in your phone's text-to-speech settings.`);return}
-    let started=false;
-    setTimeout(()=>{
+    if(!hasTTS){readCaptions(parts,token,resolve,"Voice doesn't work in this app view. Open the link in Safari or Chrome to hear her.");return}
+    let voice=pickVoice(code),sayCode=code,spell=s=>s;
+    if(!voice&&code==="ml-IN"){voice=pickVoice("en-IN")||pickVoice("en-US");sayCode=voice?voice.lang:"en-IN";spell=manglish}
+    else if(!voice&&code==="hi-IN"&&voices.length){readCaptions(parts,token,resolve,"No Hindi voice on this device. Add it in your phone's speech settings.");return}
+    let started=false,finished=false;
+    const NOSOUND=IOS?"No sound? Switch off silent mode and turn the volume up.":"";
+    const go=()=>{
       if(token!==speakToken)return resolve();
-      try{speechSynthesis.resume()}catch(e){}
       parts.forEach((p,i)=>{
-        const u=new SpeechSynthesisUtterance(p);u.lang=code;if(voice)u.voice=voice;u.rate=.95;u.pitch=1.05;u.volume=1;
+        const u=new SpeechSynthesisUtterance(spell(p));u.lang=sayCode;if(voice)u.voice=voice;u.rate=IOS?.92:.95;u.pitch=1.05;u.volume=1;
         u.onstart=()=>{if(token!==speakToken)return;started=true;show(p);setMode("speak")};
         u.onboundary=()=>{pulse=1};
-        if(i===parts.length-1)u.onend=()=>{if(token!==speakToken)return;clearInterval(keepAlive);setMode("ready");resolve()};
-        u.onerror=e=>{if(token!==speakToken||(e&&/interrupted|canceled/.test(e.error)))return;clearInterval(keepAlive);readCaptions(parts.slice(i),token,resolve)};
+        if(i===parts.length-1)u.onend=()=>{if(token!==speakToken||finished)return;finished=true;clearInterval(keepAlive);
+          if(!started){readCaptions(parts,token,resolve,NOSOUND);return}setMode("ready");resolve()};
+        u.onerror=e=>{if(token!==speakToken||finished||(e&&/interrupted|canceled/.test(e.error)))return;finished=true;clearInterval(keepAlive);readCaptions(parts.slice(i),token,resolve,NOSOUND)};
         speechSynthesis.speak(u);
       });
-      clearInterval(keepAlive);keepAlive=setInterval(()=>{try{if(speechSynthesis.speaking)speechSynthesis.resume()}catch(e){}},4000);
-      setTimeout(()=>{if(token!==speakToken||started)return;
-        if(!speechSynthesis.speaking&&!speechSynthesis.pending)readCaptions(parts,token,resolve);else{show(parts[0]);setMode("speak")}},2500);
-    },80);
+      clearInterval(keepAlive);
+      if(!IOS)keepAlive=setInterval(()=>{try{if(speechSynthesis.speaking)speechSynthesis.resume()}catch(e){}},4000);
+      setTimeout(()=>{if(token!==speakToken||started||finished)return;
+        if(!speechSynthesis.speaking&&!speechSynthesis.pending){finished=true;readCaptions(parts,token,resolve,NOSOUND)}else{show(parts[0]);setMode("speak")}},3000);
+    };
+    // speak straight away (iPhones only allow speech that starts from a tap); wait a moment only after cancelling earlier speech
+    if(busyBefore)setTimeout(go,120);else go();
   });
 }
 function stopVoice(){speakToken++;clearInterval(keepAlive);try{speechSynthesis.cancel()}catch(e){}if(mode==="speak")setMode("ready");const r=curResolve;curResolve=null;if(r)r()}
@@ -351,9 +383,12 @@ function heard(){
   ear.timer=setTimeout(()=>{if(!ear.waiter)return;const w=ear.waiter;ear.waiter=null;clearTimeout(ear.idle);
     const out=textFrom(ear.base);ear.base=ear.res.length;w(out)},last&&last.isFinal?700:2200);
 }
+function earHalt(){ear.want=false;const r=ear.rec;ear.rec=null;if(r){r.onend=null;r.onresult=null;try{r.abort()}catch(e){}}}
 function earListen(){
-  return new Promise(resolve=>{
-    if(!micOK){resolve(null);return}
+  return new Promise(res=>{
+    if(!micOK){res(null);return}
+    // on iPhone the open microphone silences her voice, so listen only during the student's turn
+    const resolve=v=>{if(IOS)earHalt();res(v)};
     earStart();
     ear.base=ear.res.length;ear.waiter=resolve;
     clearTimeout(ear.idle);
@@ -387,7 +422,7 @@ How you talk:
 const GREET="നമസ്കാരം കുട്ടീ! ഞാൻ മറിയം ടീച്ചർ. മലയാളത്തിലോ ഇംഗ്ലീഷിലോ ഹിന്ദിയിലോ എന്നോട് സംസാരിക്കാം. നിന്റെ പേരെന്താ?";
 
 const standalone=!(window.claude&&window.claude.use);
-const BUILT_IN_KEY="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";   // a kiosk copy of this file can carry its key here
+const BUILT_IN_KEY="";   // a kiosk copy of this file can carry its key here
 let memKey="";
 function getKey(){let k="";try{k=localStorage.getItem("mariam-key")||""}catch(e){}return k||memKey||BUILT_IN_KEY}
 function setKey(v){memKey=v||"";try{v?localStorage.setItem("mariam-key",v):localStorage.removeItem("mariam-key")}catch(e){}}
@@ -414,10 +449,9 @@ async function ask(text){
   const res=await sample(msgs,{cache:false,modelTier:"quick"});
   return (res.text||"").replace(/[*#_`]/g,"").trim();
 }
-async function conversation(){
+async function conversation(greeting){
   const my=++session;
-  lang="ml";history=[{role:"assistant",content:GREET}];
-  await speak(GREET,"ml-IN");
+  await greeting;
   misses=0;
   while(running&&my===session){
     // listen
@@ -434,6 +468,7 @@ async function conversation(){
       if(!running||my!==session||heard===null)break;
     }
     misses=0;nod();
+    if(IOS&&micOK)await new Promise(r=>setTimeout(r,350));
     history.push({role:"user",content:heard});
     if(!standalone&&!sample){show("Mariam Teacher needs permission to use Claude on this page. Reload and allow it.");stop(false);break}
     setMode("think");show(L[lang].think);
@@ -458,15 +493,16 @@ async function conversation(){
 async function start(){
   if(standalone&&!getKey()){$("setup").hidden=false;try{$("apiKey").focus()}catch(e){}return}
   running=true;btn.textContent="Stop talk";btn.classList.add("on");
-  try{const u=new SpeechSynthesisUtterance(" ");u.volume=0;speechSynthesis.speak(u)}catch(e){}
   try{const el=document.documentElement;(el.requestFullscreen||el.webkitRequestFullscreen||function(){}).call(el)?.catch?.(()=>{})}catch(e){}
   try{navigator.wakeLock&&navigator.wakeLock.request("screen").catch(()=>{})}catch(e){}
   // open the microphone once, from this tap, and keep it open until Stop talk
   lang="ml";micWhy="";
   if(!standalone)micWhy="claude";else if(!SR)micWhy="browser";
   micOK=!micWhy;say.placeholder=MICMSG[micWhy]||"Type and press Enter";
-  if(micOK)earStart();
-  conversation();
+  if(micOK&&!IOS)earStart();
+  // say hello inside this tap: iPhones only allow speech that a tap starts
+  lang="ml";history=[{role:"assistant",content:GREET}];
+  conversation(speak(GREET,"ml-IN"));
 }
 $("setupForm").addEventListener("submit",e=>{e.preventDefault();const v=$("apiKey").value.trim();if(!v)return;setKey(v);$("apiKey").value="";$("setup").hidden=true;start()});
 function stop(resetCaption=true){
