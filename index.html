@@ -387,20 +387,23 @@ How you talk:
 const GREET="നമസ്കാരം കുട്ടീ! ഞാൻ മറിയം ടീച്ചർ. മലയാളത്തിലോ ഇംഗ്ലീഷിലോ ഹിന്ദിയിലോ എന്നോട് സംസാരിക്കാം. നിന്റെ പേരെന്താ?";
 
 const standalone=!(window.claude&&window.claude.use);
-function getKey(){try{return localStorage.getItem("mariam-key")||""}catch(e){return ""}}
-function setKey(v){try{v?localStorage.setItem("mariam-key",v):localStorage.removeItem("mariam-key")}catch(e){}}
+const BUILT_IN_KEY="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";   // a kiosk copy of this file can carry its key here
+let memKey="";
+function getKey(){let k="";try{k=localStorage.getItem("mariam-key")||""}catch(e){}return k||memKey||BUILT_IN_KEY}
+function setKey(v){memKey=v||"";try{v?localStorage.setItem("mariam-key",v):localStorage.removeItem("mariam-key")}catch(e){}}
 async function askApi(){
   const msgs=[{role:"user",content:"(The student pressed Start talk.)"}];
   history.slice(-14).forEach(m=>{const last=msgs[msgs.length-1];if(last.role===m.role)last.content+="\n"+m.content;else msgs.push({role:m.role,content:m.content})});
   let lastErr=null;
   for(const model of ["claude-haiku-5-5","claude-sonnet-5-5"]){
-    const r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"content-type":"application/json","x-api-key":getKey(),
+    let r;try{r=await fetch("https://api.anthropic.com/v1/messages",{method:"POST",headers:{"content-type":"application/json","x-api-key":getKey(),
       "anthropic-version":"2023-06-01","anthropic-dangerous-direct-browser-access":"true"},
-      body:JSON.stringify({model,max_tokens:500,system:PERSONA,messages:msgs})});
+      body:JSON.stringify({model,max_tokens:500,system:PERSONA,messages:msgs})})}catch(e){throw {code:"offline"}}
     if(r.ok){const j=await r.json();return (j.content||[]).filter(c=>c.type==="text").map(c=>c.text).join(" ")}
-    if(r.status===401||r.status===403){setKey("");throw {code:"bad_key"}}
-    if(r.status===429)throw {code:"rate_limited"};
-    lastErr={code:"api_"+r.status};if(r.status!==404&&r.status!==400)break;
+    let why="";try{const j=await r.json();why=(j&&j.error&&j.error.message)||""}catch(e){}
+    if(r.status===401||r.status===403)throw {code:"bad_key",why};   // keep the saved key; just report it
+    if(r.status===429)throw {code:"rate_limited",why};
+    lastErr={code:"api",status:r.status,why};if(r.status!==404&&r.status!==400)break;
   }
   throw lastErr||{code:"api"};
 }
@@ -437,7 +440,12 @@ async function conversation(){
     let ans="";
     try{ans=await ask(heard)}catch(e){
       history.pop();
-      show(e&&e.code==="bad_key"?"The API key didn't work. Tap Start talk to enter it again.":e&&e.code==="rate_limited"?"Please wait a minute, then tap Start talk again.":e&&e.code==="not_granted"?"Mariam Teacher needs permission to use Claude on this page.":"Mariam Teacher couldn't get an answer. Check the internet connection, then tap Start talk.");
+      const why=e&&e.why?" ("+e.why+")":"";
+      show(e&&e.code==="bad_key"?"Anthropic refused the saved API key"+why+". Create a new key at console.anthropic.com, then hold Start talk for 3 seconds to change it."
+        :e&&e.code==="rate_limited"?"Please wait a minute, then tap Start talk again."+why
+        :e&&e.code==="offline"?"No internet connection. Connect, then tap Start talk."
+        :e&&e.code==="not_granted"?"Mariam Teacher needs permission to use Claude on this page."
+        :"Mariam Teacher couldn't get an answer"+(e&&e.status?" (error "+e.status+")":"")+why+". Tap Start talk to try again.");
       stop(false);break;
     }
     if(!running||my!==session)break;
@@ -466,7 +474,11 @@ function stop(resetCaption=true){
   stopVoice();earStop();if(stopTyping)stopTyping();
   listenEl.hidden=true;say.hidden=true;setMode("ready");if(resetCaption)setIdleCaption();
 }
-btn.onclick=()=>running?stop():start();
+// hold Start talk for 3 seconds to enter a different API key (only needed outside claude.ai)
+let holdT=null,held=false;
+btn.addEventListener("pointerdown",()=>{held=false;if(!standalone||running)return;holdT=setTimeout(()=>{held=true;$("setup").hidden=false;try{$("apiKey").focus()}catch(e){}},3000)});
+["pointerup","pointerleave","pointercancel"].forEach(ev=>btn.addEventListener(ev,()=>clearTimeout(holdT)));
+btn.onclick=()=>{if(held){held=false;return}running?stop():start()};
 $("cam").addEventListener("click",()=>{if(running&&mode==="speak"){stopVoice()}});
 
 setIdleCaption();
